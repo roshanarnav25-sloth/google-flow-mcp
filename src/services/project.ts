@@ -1,4 +1,4 @@
-import { FLOW_HOME } from "../constants.js";
+import { FLOW_HOME, projectUrl } from "../constants.js";
 import { FlowError } from "../types.js";
 import { assertNoStopSignal, getFlowPage } from "./browser.js";
 import { extractProjectId } from "./session.js";
@@ -24,17 +24,27 @@ export interface FlowProject {
 export async function listProjects(): Promise<FlowProject[]> {
   const page = await getFlowPage();
   await assertNoStopSignal(page);
+  // The Angular grid renders after domcontentloaded; on a freshly launched browser
+  // an immediate scan finds nothing. A home page with no projects just times out.
+  await page.waitForSelector('a[href*="/project/"]', { timeout: 8_000 }).catch(() => undefined);
 
   return page.evaluate(() => {
     const seen = new Map<string, { projectId: string; name: string | null; url: string }>();
     for (const a of document.querySelectorAll<HTMLAnchorElement>('a[href*="/project/"]')) {
       const m = /\/project\/([A-Za-z0-9_-]+)/.exec(a.href);
       if (!m || seen.has(m[1])) continue;
-      seen.set(m[1], {
-        projectId: m[1],
-        name: (a.getAttribute("aria-label") ?? a.textContent ?? "").trim() || null,
-        url: a.href,
-      });
+      // The link is a thumbnail labelled "Open project"; the title is the text node
+      // of the card's .project-title-label, beside its "Edit project title" button.
+      const label = a.closest("flow-project-card")?.querySelector(".project-title-label");
+      const title = label
+        ? [...label.childNodes]
+            .filter((n) => n.nodeType === Node.TEXT_NODE)
+            .map((n) => n.textContent ?? "")
+            .join(" ")
+            .trim()
+        : "";
+      const fallback = (a.textContent ?? "").trim();
+      seen.set(m[1], { projectId: m[1], name: title || fallback || null, url: a.href });
     }
     return [...seen.values()];
   });
@@ -42,7 +52,7 @@ export async function listProjects(): Promise<FlowProject[]> {
 
 export async function openProject(projectId: string): Promise<FlowProject> {
   const page = await getFlowPage();
-  const url = `${FLOW_HOME}/project/${projectId}`;
+  const url = projectUrl(projectId);
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
   await page.waitForTimeout(3_000);
   await assertNoStopSignal(page);
@@ -73,7 +83,9 @@ export async function createProject(name?: string): Promise<FlowProject> {
   const clicked = await page.evaluate(() => {
     const btn = [...document.querySelectorAll<HTMLElement>("button,[role=button],a")].find((b) => {
       const label = `${b.getAttribute("aria-label") ?? ""} ${b.textContent ?? ""}`.replace(/\s+/g, " ").trim();
-      return /^(new project|create project|new)$/i.test(label) && b.offsetParent !== null;
+      return (
+        /^(add_2\s*)?(new project|create project|new|start a new project)$/i.test(label) && b.offsetParent !== null
+      );
     });
     if (!btn) return false;
     btn.click();

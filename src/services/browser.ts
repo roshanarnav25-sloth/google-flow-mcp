@@ -1,6 +1,6 @@
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import { config } from "../config.js";
-import { FLOW_HOME, FLOW_ORIGIN, STOP_SIGNALS, TIMEOUTS } from "../constants.js";
+import { FLOW_HOME, FLOW_ORIGIN, STOP_SIGNALS, TIMEOUTS, isFlowUrl } from "../constants.js";
 import { FlowError, StopSignalError } from "../types.js";
 
 let browser: Browser | null = null;
@@ -15,9 +15,20 @@ let mode: "cdp-attach" | "launched" | "none" = "none";
  * the human owns the login, we borrow the tab. `launchPersistentContext` is the
  * fallback for a headless box, and requires a one-time interactive login.
  */
+let connecting: Promise<BrowserContext> | null = null;
+
 export async function getContext(): Promise<BrowserContext> {
   if (context && isAlive()) return context;
+  // MCP clients may call tools in parallel. Two concurrent launches on one persistent
+  // profile race, and the loser fails with "profile is already in use" — so every
+  // caller shares the one in-flight connect.
+  connecting ??= connect().finally(() => {
+    connecting = null;
+  });
+  return connecting;
+}
 
+async function connect(): Promise<BrowserContext> {
   if (config.cdpUrl) {
     try {
       browser = await chromium.connectOverCDP(config.cdpUrl, { timeout: 10_000 });
@@ -26,7 +37,7 @@ export async function getContext(): Promise<BrowserContext> {
         `Could not attach to Chrome at ${config.cdpUrl}: ${(err as Error).message}`,
         `Start Chrome with remote debugging, then retry:\n` +
           `  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.google-flow-mcp/chrome-profile"\n` +
-          `Log into labs.google/fx/tools/flow in that window first. ` +
+          `Log into flow.google.com in that window first. ` +
           `Or unset FLOW_CDP_URL to let this server launch its own browser.`,
       );
     }
@@ -38,10 +49,23 @@ export async function getContext(): Promise<BrowserContext> {
       headless: config.headless,
       channel: config.channel,
       viewport: { width: 1440, height: 900 },
+      // No acceptDownloads: with it on, Chrome completes Flow's downloads and
+      // crashes at completion (EXCEPTION_ACCESS_VIOLATION at chrome.dll+0x2f199a,
+      // every time, 2026-09-24). Clip lookups want the download refused anyway;
+      // scene exports route their one download through CDP (see scene.ts).
       args: ["--disable-blink-features=AutomationControlled"],
     });
     browser = null;
     mode = "launched";
+    // A launched context has no Browser to ask isConnected(); without this, closing
+    // the window leaves a dead handle that every later call trips over.
+    const launched = context;
+    launched.on("close", () => {
+      if (context !== launched) return;
+      context = null;
+      page = null;
+      mode = "none";
+    });
   }
 
   context.setDefaultTimeout(TIMEOUTS.evalMs);
@@ -64,16 +88,16 @@ export function browserMode(): "cdp-attach" | "launched" | "none" {
 export async function getFlowPage(): Promise<Page> {
   const ctx = await getContext();
 
-  if (page && !page.isClosed() && page.url().startsWith(FLOW_ORIGIN)) return page;
+  if (page && !page.isClosed() && isFlowUrl(page.url())) return page;
 
-  const existing = ctx.pages().find((p) => !p.isClosed() && p.url().includes("/fx/tools/flow"));
+  const existing = ctx.pages().find((p) => !p.isClosed() && isFlowUrl(p.url()));
   if (existing) {
     page = existing;
     return page;
   }
 
   page = ctx.pages().find((p) => !p.isClosed()) ?? (await ctx.newPage());
-  if (!page.url().includes("/fx/tools/flow")) {
+  if (!isFlowUrl(page.url())) {
     await page.goto(FLOW_HOME, { waitUntil: "domcontentloaded", timeout: 60_000 });
   }
   return page;
@@ -107,7 +131,7 @@ export async function assertNoStopSignal(p?: Page): Promise<void> {
   }
 }
 
-/** Cookies for the labs.google origin, for the Node-side HTTP tier. */
+/** Cookies for the Flow origin, for the Node-side HTTP tier. */
 export async function cookieHeader(): Promise<string> {
   const ctx = await getContext();
   const cookies = await ctx.cookies(FLOW_ORIGIN);

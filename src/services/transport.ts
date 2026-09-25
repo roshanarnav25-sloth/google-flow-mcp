@@ -187,7 +187,7 @@ export async function clickByText(
     ([target, exact, maxKids]) => {
       const nodes = [...document.querySelectorAll<HTMLElement>("button,div[role],div,span")];
       const match = nodes.filter((el) => {
-        if (!el.offsetParent) return false;
+        if (el.getClientRects().length === 0) return false; // offsetParent is null inside fixed overlays
         if (el.querySelectorAll("*").length > (maxKids as number)) return false;
         const t = (el.textContent ?? "").replace(/\s+/g, "");
         return exact

@@ -1,4 +1,3 @@
-import { AUTH_SESSION_URL } from "../constants.js";
 import { config } from "../config.js";
 import type { SessionState } from "../types.js";
 import { assertNoStopSignal, browserMode, getFlowPage } from "./browser.js";
@@ -38,16 +37,16 @@ export async function readSession(): Promise<SessionState> {
     state.blockedBy = (err as Error).message;
   }
 
-  // NextAuth session endpoint: cheapest logged-in probe, and it never charges.
+  // flow.google.com has no NextAuth endpoint. The One Google bar's account button
+  // carries "Google Account: <name> (<email>)" only when a user is signed in.
   try {
-    const session = await page.evaluate(async (url) => {
-      const r = await fetch(url, { credentials: "include" });
-      return r.ok ? await r.text() : null;
-    }, AUTH_SESSION_URL);
-    if (session) {
-      const parsed = JSON.parse(session) as { user?: { email?: string; name?: string } };
-      state.account = parsed?.user?.email ?? parsed?.user?.name ?? null;
-      state.loggedIn = Boolean(state.account);
+    const label = await page.evaluate(() => {
+      const el = document.querySelector<HTMLElement>('[aria-label^="Google Account:"]');
+      return el?.getAttribute("aria-label") ?? null;
+    });
+    if (label) {
+      state.account = /\(([^)]+@[^)]+)\)/.exec(label)?.[1] ?? label.replace(/^Google Account:\s*/, "");
+      state.loggedIn = true;
     }
   } catch {
     // Fall through to the URL heuristic below.
@@ -66,30 +65,68 @@ export function extractProjectId(url: string): string | null {
   return /\/project\/([A-Za-z0-9_-]+)/.exec(url)?.[1] ?? null;
 }
 
+/** @internal exported for unit tests. Pulls a balance out of credit-shaped text. */
+export function parseCredits(text: string): number | null {
+  // Never a bare "N credits": the composer's "Generating will use N credits" quote
+  // would read as a balance and defeat the affordability check.
+  const patterns = [/([\d,]+)\s+Google\s+Flow\s+credits?\b/i, /([\d,]+)\s*credits?\s*(?:remaining|left|available)/i];
+  for (const p of patterns) {
+    const m = p.exec(text);
+    if (m) {
+      const n = Number.parseInt(m[1].replace(/,/g, ""), 10);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
 /**
- * Credit balance. It lives behind the avatar menu rather than on the main screen,
- * so the DOM sweep is a best-effort scan for a credits-shaped number anywhere in
- * the rendered text. Returns null rather than guessing — callers treat an unknown
+ * Credit balance. On flow.google.com it lives in the account panel behind the One
+ * Google avatar ("50 Google Flow credits"), which is only in the DOM while open —
+ * so open it, read it, close it. The panel also holds "Sign out of all accounts",
+ * so it is closed by its exact aria-label, never by text. Falls back to scanning
+ * the visible page. Returns null rather than guessing — callers treat an unknown
  * balance as "cannot verify budget" rather than "budget is fine".
  */
 export async function readCredits(): Promise<number | null> {
   try {
-    const text = await pageText();
-    const patterns = [
-      /([\d,]+)\s*credits?\s*(?:remaining|left|available)/i,
-      /credits?\s*(?:remaining|left|available)?\s*[:•]?\s*([\d,]+)/i,
-    ];
-    for (const p of patterns) {
-      const m = p.exec(text);
-      if (m) {
-        const n = Number.parseInt(m[1].replace(/,/g, ""), 10);
-        if (Number.isFinite(n)) return n;
+    const page = await getFlowPage();
+    // One in-page script, as verified live: a DOM click, not locator.click(). The
+    // account button failed Playwright's actionability wait in the launched
+    // profile and the balance silently read null, though the same button's label
+    // is what proves sign-in.
+    const text = await page.evaluate(async () => {
+      const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+      const panel = () => document.querySelector<HTMLElement>("flow-account-panel");
+      const alreadyOpen = panel() !== null;
+      if (!alreadyOpen) {
+        const trigger = [...document.querySelectorAll<HTMLElement>('[aria-label^="Google Account:"]')].find(
+          (e) => e.getClientRects().length > 0,
+        );
+        if (!trigger) return null;
+        trigger.click();
       }
-    }
+      let count: Element | null = null;
+      for (let i = 0; i < 40 && !count?.textContent?.trim(); i++) {
+        await sleep(150);
+        count = panel()?.querySelector(".credits-count") ?? null;
+      }
+      const read = count?.textContent?.trim() ?? null;
+      if (!alreadyOpen) {
+        panel()?.querySelector<HTMLElement>('button[aria-label="Close account panel"]')?.click();
+      }
+      return read;
+    });
+    const n = parseCredits(text ?? "");
+    if (n !== null) return n;
   } catch {
-    /* unknown */
+    /* fall through to the page-text scan */
   }
-  return null;
+  try {
+    return parseCredits(await pageText());
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -120,8 +157,9 @@ export function describeSession(s: SessionState): string {
   if (s.blockedBy) lines.push(`BLOCKED: ${s.blockedBy}`);
   if (s.confirmGate !== "always") {
     lines.push(
-      `WARNING: the approval gate is not confirmed ON. Flow may generate and charge without showing a cost card. ` +
-        `Open Settings -> "Confirm before generating" and set it to Always before any paid generation.`,
+      `Note: "Confirm before generating" is not confirmed Always. On flow.google.com it only governs Agent mode; ` +
+        `this server sends in direct mode behind the composer's price quote and refuses if Agent mode is on. ` +
+        `If you use Agent mode by hand, set it to Always in the session panel's agent settings.`,
     );
   }
   return lines.join("\n");

@@ -10,7 +10,7 @@ import { config } from "./config.js";
 import { ABSOLUTE_COST_CEILING, CREDIT_COSTS, RETRY_BUDGET_MULTIPLIER } from "./constants.js";
 import { listApps, openApp } from "./services/apps.js";
 import { closeBrowser } from "./services/browser.js";
-import { readSettings, setSetting, uploadMedia, upscale } from "./services/compose.js";
+import { applySettings, readSettings, uploadMedia, upscale } from "./services/compose.js";
 import { discoverApi, formatReport, verifyHttpTier } from "./services/discovery.js";
 import { collect, generate } from "./services/generate.js";
 import { deleteMedia, downloadMedia, listMedia } from "./services/media.js";
@@ -81,7 +81,7 @@ server.registerTool(
   async ({ duration_seconds, navigate }) => {
     try {
       const report = await discoverApi(duration_seconds * 1000, navigate);
-      return ok(formatReport(report), { requestsSeen: report.requestsSeen, endpoints: report.endpoints.length });
+      return ok(formatReport(report), { ...report });
     } catch (err) {
       return fail(err);
     }
@@ -126,12 +126,13 @@ server.registerTool(
       if (endpoints.length === 0) {
         return ok("No endpoints learned yet. Run flow_discover_api first.");
       }
-      if (response_format === "json") return ok(JSON.stringify(map, null, 2), { count: endpoints.length });
+      if (response_format === "json") return ok(JSON.stringify(map, null, 2), { count: endpoints.length, ...map });
       const lines = endpoints.map(
         (e) => `${e.method.padEnd(4)} ${e.procedure}${e.httpSafe ? "  [http-safe]" : ""}  (seen ${e.sampleCount}x)`,
       );
       return ok(`Learned ${endpoints.length} endpoints, last updated ${map.discoveredAt}:\n\n${lines.join("\n")}`, {
         count: endpoints.length,
+        ...map,
       });
     } catch (err) {
       return fail(err);
@@ -146,7 +147,7 @@ server.registerTool(
   {
     title: "Generate still images (free)",
     description:
-      "Generate still images in Flow. Stills cost ZERO credits, so this is the sandbox where composition should be iterated until right — always compose in stills before spending anything on video. Downloads the results and returns local file paths.",
+      "Generate still images with the composer's image model. The composer's quote is read before sending and the call refuses unless it is exactly 0 credits, so this never spends. Compose in stills before spending anything on video. Downloads every output and returns local file paths and media ids.",
     inputSchema: {
       prompt: z.string().min(10).max(4000).describe("Full composition prompt: subject, setting, light, lens, grade"),
       out_file: z.string().optional().describe("Output filename; relative paths resolve under FLOW_OUTPUT_DIR"),
@@ -179,7 +180,7 @@ server.registerTool(
   {
     title: "Price a generation without paying",
     description:
-      "Submit a request to Flow, read the quoted credit cost from its proposal, then REJECT it. Costs exactly zero — a rejected proposal is never charged. Use this to confirm the project's model tier before committing to a batch.",
+      "Set up the video composer with this prompt, read the price it quotes, then clear it without sending. Costs exactly zero. Use it to confirm the model tier before committing to a batch.",
     inputSchema: {
       prompt: z.string().min(10).max(4000).describe("The prompt you intend to run"),
     },
@@ -189,8 +190,8 @@ server.registerTool(
     try {
       const result = await generate({ prompt, expectedMaxCost: ABSOLUTE_COST_CEILING, dryRun: true });
       return ok(
-        `Flow quoted ${result.quotedCost} credits. Proposal rejected — nothing charged.\n` +
-          `Reference: Veo 3.1 Lite 10, Fast 20, Quality 100. A quote far above the intended tier means the project settings are wrong.`,
+        `The composer quoted ${result.quotedCost} credits. Nothing was sent or charged.\n` +
+          `Reference: Veo 3.1 Lite 10, Fast 20, Quality 100 per 8s clip; Omni 1.1 Flash 6 (360p) / 12 (720p). A quote above the intended tier means the settings are wrong.`,
         { quotedCost: result.quotedCost, charged: 0 },
       );
     } catch (err) {
@@ -204,7 +205,7 @@ server.registerTool(
   {
     title: "Generate video (SPENDS CREDITS)",
     description:
-      "Generate a video clip in Flow. THIS SPENDS REAL CREDITS. The cost quoted by Flow is read and checked against expected_max_cost and the run budget BEFORE approval; if it exceeds either, the proposal is rejected and nothing is charged. The generation MODE is set by what you attach: start_frame_media_id gives Frames-to-Video (preserves the approved composition — the normal path), reference_media_ids gives Ingredients-to-Video (recomposes from up to 3 references), and attaching nothing gives Text-to-Video (least control). Compose in free stills first and animate an approved still rather than generating blind. Never call this twice for the same clip while one is in flight — a resubmit is a second charge. Model tier and aspect ratio are per-project settings; set them with flow_settings, not here.",
+      "Generate a video clip in Flow. THIS SPENDS REAL CREDITS. The composer's quoted cost is read and checked against expected_max_cost and the run budget BEFORE sending; if it exceeds either, the prompt is cleared and nothing is charged. The generation MODE is set by what you attach: start_frame_media_id gives Frames-to-Video (preserves the approved composition — the normal path), reference_media_ids gives Ingredients-to-Video (recomposes from up to 3 references), and attaching nothing gives Text-to-Video (least control). Compose in free stills first and animate an approved still rather than generating blind. Never call this twice for the same clip while one is in flight — a resubmit is a second charge. Model tier and aspect ratio are per-project settings; set them with flow_settings, not here.",
     inputSchema: {
       prompt: z
         .string()
@@ -261,7 +262,7 @@ server.registerTool(
       });
       const summary =
         result.verdict === "in_flight"
-          ? `Approved at ${result.charged} credits and returned without waiting. Use flow_collect to download.`
+          ? `Sent at ${result.charged} credits and returned without waiting. Use flow_collect to download.`
           : `Charged ${result.charged} credits. Saved:\n${result.files.join("\n")}\nBalance after: ${result.balanceAfter ?? "unknown"}`;
       return ok(`${summary}\n\n${result.notes.join("\n")}`, {
         verdict: result.verdict,
@@ -316,18 +317,25 @@ server.registerTool(
   },
   async ({ limit, offset, response_format }) => {
     try {
-      const { items, total } = await listMedia(limit, offset);
+      const { items, total, unresolved } = await listMedia(limit, offset);
+      // Paging is over grid tiles, not resolved items: a tile that could not be
+      // resolved is reported in `unresolved`, not re-offered on the next page.
       const payload = {
         total,
         count: items.length,
         offset,
         items,
-        has_more: offset + items.length < total,
-        next_offset: offset + items.length,
+        unresolved,
+        has_more: offset + limit < total,
+        next_offset: Math.min(offset + limit, total),
       };
       if (response_format === "json") return ok(JSON.stringify(payload, null, 2), payload);
       const lines = items.map((i) => `${i.kind.padEnd(6)} ${i.mediaId}${i.name ? `  (${i.name})` : ""}`);
-      return ok(`${total} item(s), showing ${items.length} from offset ${offset}:\n\n${lines.join("\n")}`, payload);
+      const skipped = unresolved.length ? `\n\nCould not resolve ${unresolved.length}:\n${unresolved.join("\n")}` : "";
+      return ok(
+        `${total} item(s), showing ${items.length} from offset ${offset}:\n\n${lines.join("\n")}${skipped}`,
+        payload,
+      );
     } catch (err) {
       return fail(err);
     }
@@ -389,18 +397,19 @@ server.registerTool(
 server.registerTool(
   "flow_export_scene",
   {
-    title: "Export the open Scenebuilder scene",
+    title: "Export a scene",
     description:
-      "Export the currently open Scenebuilder scene to an MP4 on disk. Stitching clips is FREE — only Scenebuilder's 'Extend' costs credits, and this tool never uses it. Captures the export job's video payload directly, since Flow's export never writes a file itself.",
+      "Export a scene (/scene/<id>) to an MP4 on disk via its 'Download scene' button. FREE — only 'Extend' costs credits, and this tool never uses it. Pass scene_id from flow_add_clips_to_scene, or run it while the browser is on the scene. A single clip's editor (/edit/<id>) is refused: its download is just that clip.",
     inputSchema: {
       out_file: z.string().describe("Output .mp4 path; relative paths resolve under FLOW_OUTPUT_DIR"),
+      scene_id: z.string().optional().describe("Scene id from flow_add_clips_to_scene; opens that scene first"),
       timeout_seconds: z.number().int().min(30).max(900).default(300),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
-  async ({ out_file, timeout_seconds }) => {
+  async ({ out_file, scene_id, timeout_seconds }) => {
     try {
-      const saved = await exportScene(out_file, timeout_seconds * 1000);
+      const saved = await exportScene(out_file, timeout_seconds * 1000, scene_id);
       return ok(
         `Exported scene (${saved.bytes.toLocaleString()} bytes) to ${saved.file}. Stitching is free; nothing charged.`,
         saved,
@@ -468,7 +477,7 @@ server.registerTool(
     try {
       const entries = await readLedger(limit);
       if (entries.length === 0) return ok("Ledger is empty — no generations recorded yet.");
-      if (response_format === "json") return ok(JSON.stringify(entries, null, 2), { count: entries.length });
+      if (response_format === "json") return ok(JSON.stringify(entries, null, 2), { count: entries.length, entries });
       const totalCharged = entries.reduce((sum, e) => sum + e.charged, 0);
       const lines = entries.map(
         (e) =>
@@ -477,6 +486,7 @@ server.registerTool(
       return ok(`Last ${entries.length} entries (${totalCharged} credits charged):\n\n${lines.join("\n")}`, {
         count: entries.length,
         totalCharged,
+        entries,
       });
     } catch (err) {
       return fail(err);
@@ -489,46 +499,77 @@ server.registerTool(
 server.registerTool(
   "flow_settings",
   {
-    title: "Read or change project generation settings",
+    title: "Read or change composer generation settings",
     description:
-      "Read or change Flow's per-PROJECT generation settings: model tier, aspect ratio, and outputs per prompt. These are project globals, not per-generation arguments — set once, they persist across chat turns. Changing the tier is free and is the highest-leverage cost control there is: moving a project from Veo Quality to Fast turns every subsequent clip from 100 credits into 20. Re-read this after switching projects.",
+      "Read or change the settings of Flow's prompt box on flow.google.com: kind (image/video), video mode (frames/ingredients), model, aspect ratio, resolution, clip length and outputs per prompt, plus the price the composer quotes for the next submission. Free: nothing is sent. The model tier is the biggest cost lever (Veo 3.1 Fast 20 credits per 8s clip, Lite 10, Quality 100; Omni 1.1 Flash 6 at 360p or 12 at 720p per 8s). Settings persist in the composer between calls.",
     inputSchema: {
       action: z.enum(["get", "set"]).default("get"),
-      model: z.string().optional().describe('Exact option label, e.g. "Veo 3.1 Fast". Only for action=set'),
-      aspect_ratio: z.enum(["16:9", "9:16", "1:1"]).optional().describe("Only for action=set"),
+      kind: z.enum(["image", "video"]).optional().describe("Only for action=set"),
+      video_mode: z.enum(["frames", "ingredients"]).optional().describe("Only for action=set"),
+      model: z
+        .string()
+        .optional()
+        .describe(
+          'Exact option label, e.g. "Veo 3.1 - Fast", "Omni 1.1 Flash", "Nano Banana 2 Lite". Only for action=set',
+        ),
+      aspect_ratio: z.enum(["16:9", "9:16", "4:3", "1:1", "3:4"]).optional().describe("Only for action=set"),
+      resolution: z.enum(["360p", "720p", "1080p"]).optional().describe("Only offered for some models"),
       outputs_per_prompt: z
         .number()
         .int()
         .min(1)
         .max(4)
         .optional()
-        .describe("Keep at 1 — outputs multiply cost linearly"),
+        .describe("Keep at 1 for video: outputs multiply cost linearly"),
       duration_seconds: z
         .number()
         .int()
         .min(4)
         .max(10)
         .optional()
-        .describe("Clip length. A cost lever on Gemini Omni Flash, which charges 15/20/25/30 credits by duration"),
+        .describe("Clip length, where the model offers a choice (Omni: 4/6/8/10s). Veo is fixed at 8s"),
       response_format: responseFormat,
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
-  async ({ action, model, aspect_ratio, outputs_per_prompt, duration_seconds, response_format }) => {
+  async ({
+    action,
+    kind,
+    video_mode,
+    model,
+    aspect_ratio,
+    resolution,
+    outputs_per_prompt,
+    duration_seconds,
+    response_format,
+  }) => {
     try {
-      let settings = await readSettings();
-      if (action === "set") {
-        if (model) settings = await setSetting("model", model);
-        if (aspect_ratio) settings = await setSetting("aspectRatio", aspect_ratio);
-        if (outputs_per_prompt) settings = await setSetting("outputsPerPrompt", String(outputs_per_prompt));
-        if (duration_seconds) settings = await setSetting("durationSeconds", `${duration_seconds}s`);
-      }
+      const settings =
+        action === "set"
+          ? await applySettings({
+              kind,
+              videoMode: video_mode,
+              model,
+              aspectRatio: aspect_ratio,
+              resolution,
+              outputsPerPrompt: outputs_per_prompt,
+              durationSeconds: duration_seconds,
+            })
+          : await readSettings();
       if (response_format === "json") return ok(JSON.stringify(settings, null, 2), { ...settings });
+      const agent =
+        settings.agentMode === null ? "unknown" : settings.agentMode ? "ON (switched off before generating)" : "off";
       return ok(
-        `Model: ${settings.model ?? "unknown"}\nAspect: ${settings.aspectRatio ?? "unknown"}\n` +
-          `Outputs per prompt: ${settings.outputsPerPrompt ?? "unknown"}\nDuration: ${settings.durationSeconds ?? "unknown"}s\n` +
-          `Confirm gate: ${settings.confirmGate}\n\n` +
-          `Costs: Lite 10 cr, Fast 20 cr, Quality 100 cr. Outputs multiply cost linearly — keep this at 1 unless told otherwise.`,
+        [
+          `Kind: ${settings.kind ?? "unknown"}${settings.videoMode ? ` (${settings.videoMode})` : ""}`,
+          `Model: ${settings.model ?? "unknown"}`,
+          `Aspect: ${settings.aspectRatio ?? "unknown"}`,
+          `Resolution: ${settings.resolution ?? "n/a"}`,
+          `Duration: ${settings.durationSeconds ? settings.durationSeconds + "s" : "n/a"}`,
+          `Outputs per prompt: ${settings.outputsPerPrompt ?? "unknown"}`,
+          `Agent mode: ${agent}`,
+          `Quoted price of the next submission: ${settings.quotedCredits ?? "unknown"} credits`,
+        ].join("\n"),
         { ...settings },
       );
     } catch (err) {
@@ -542,7 +583,7 @@ server.registerTool(
   {
     title: "Upload a local image into Flow",
     description:
-      "Upload a local image file into the Flow project so it can be used as a start frame or reference. Free. After upload, confirm the resulting media id with flow_list_media before animating it.",
+      "Upload a local image file into the Flow project so it can be used as a start or end frame. Free. Returns the new media id once the library shows it.",
     inputSchema: { file_path: z.string().describe("Absolute path to a local image file") },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
@@ -605,9 +646,13 @@ server.registerTool(
     try {
       const projects = await listProjects();
       if (projects.length === 0)
-        return ok("No project links visible. Navigate to labs.google/fx/tools/flow in the attached browser.");
-      if (response_format === "json") return ok(JSON.stringify(projects, null, 2), { count: projects.length });
-      return ok(projects.map((p) => `${p.projectId}  ${p.name ?? "(unnamed)"}`).join("\n"), { count: projects.length });
+        return ok("No project links visible. Navigate to flow.google.com in the attached browser.");
+      if (response_format === "json")
+        return ok(JSON.stringify(projects, null, 2), { count: projects.length, projects });
+      return ok(projects.map((p) => `${p.projectId}  ${p.name ?? "(unnamed)"}`).join("\n"), {
+        count: projects.length,
+        projects,
+      });
     } catch (err) {
       return fail(err);
     }
@@ -659,17 +704,19 @@ server.registerTool(
 server.registerTool(
   "flow_create_scene",
   {
-    title: "Create a Scenebuilder scene",
+    title: "Open a scene editor for a clip",
     description:
-      "Create a new Scenebuilder scene for stitching clips. FREE. Flow's chat agent cannot do this — it is a UI-only surface.",
-    inputSchema: {},
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+      "Open the scene editor that starts with this video clip. FREE. On flow.google.com there is no empty scene: opening a clip routes to its editor (/project/<p>/edit/<id>), which holds the timeline. Then add clips with flow_add_clips_to_scene and export with flow_export_scene.",
+    inputSchema: {
+      first_clip_media_id: z.string().describe("Video media id from flow_list_media; the scene starts with this clip"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
-  async () => {
+  async ({ first_clip_media_id }) => {
     try {
-      const scene = await createScene();
+      const scene = await createScene(first_clip_media_id);
       return ok(
-        `Created scene ${scene.sceneId}. Add clips with flow_add_clips_to_scene, then export with flow_export_scene. Stitching is free.`,
+        `Opened scene editor ${scene.sceneId}. Add clips with flow_add_clips_to_scene, then export with flow_export_scene. Stitching is free.`,
         { ...scene },
       );
     } catch (err) {
@@ -692,7 +739,11 @@ server.registerTool(
   async ({ media_ids }) => {
     try {
       const result = await addClipsToScene(media_ids);
-      const text = `Added ${result.added.length} clip(s)${result.failed.length ? `; failed: ${result.failed.join(", ")}` : ""}. Nothing charged.`;
+      const text =
+        `Added ${result.added.length} clip(s)${result.failed.length ? `; failed: ${result.failed.join(", ")}` : ""}. Nothing charged.` +
+        (result.sceneId
+          ? ` Now on scene ${result.sceneId}; export it with flow_export_scene (scene_id: ${result.sceneId}).`
+          : " Flow did not move to a /scene/ page; check the browser before exporting.");
       return ok(text, { ...result });
     } catch (err) {
       return fail(err);
@@ -715,11 +766,11 @@ server.registerTool(
     try {
       const apps = await listApps();
       if (apps.length === 0) return ok("No apps detected. Open a project and navigate to its Tools tab.");
-      if (response_format === "json") return ok(JSON.stringify(apps, null, 2), { count: apps.length });
+      if (response_format === "json") return ok(JSON.stringify(apps, null, 2), { count: apps.length, apps });
       const lines = apps.map((a) => `${a.name}${a.description ? ` — ${a.description.slice(0, 80)}` : ""}`);
       return ok(
         `${apps.length} app(s):\n${lines.join("\n")}\n\nNone of these quote a cost. Prefer local ffmpeg for concatenation and resizing; reserve Flow apps for things you cannot reproduce locally.`,
-        { count: apps.length },
+        { count: apps.length, apps },
       );
     } catch (err) {
       return fail(err);

@@ -1,3 +1,4 @@
+import { projectUrl } from "../constants.js";
 import { FlowError } from "../types.js";
 import { assertNoStopSignal, getFlowPage } from "./browser.js";
 import { extractProjectId } from "./session.js";
@@ -46,7 +47,7 @@ export async function listApps(): Promise<FlowApp[]> {
   }
 
   if (!/\/tools/.test(page.url())) {
-    await page.goto(`https://labs.google/fx/tools/flow/project/${projectId}/tools`, {
+    await page.goto(`${projectUrl(projectId)}/tools`, {
       waitUntil: "domcontentloaded",
       timeout: 60_000,
     });
